@@ -9,7 +9,6 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-// ✅ Health check
 app.get('/', (req, res) => {
   res.json({
     status: 'TradeHub OI Server running',
@@ -22,7 +21,6 @@ app.get('/', (req, res) => {
   });
 });
 
-// ✅ NEW: Find Railway's outbound IP
 app.get('/myip', async (req, res) => {
   try {
     const response = await axios.get('https://api.ipify.org?format=json');
@@ -32,24 +30,17 @@ app.get('/myip', async (req, res) => {
   }
 });
 
-// ✅ Angel One Login Helper
 async function angelLogin() {
   const apiKey = process.env.ANGEL_API_KEY;
   const clientId = process.env.ANGEL_CLIENT_ID;
   const pin = process.env.ANGEL_PIN;
   const totpSecret = process.env.ANGEL_TOTP_SECRET;
 
-  console.log('Logging in with:', { apiKey: !!apiKey, clientId, pin: !!pin, totpSecret: !!totpSecret });
-
   const totpToken = totp(totpSecret);
 
   const loginRes = await axios.post(
     'https://apiconnect.angelone.in/rest/auth/angelbroking/user/v1/loginByPassword',
-    {
-      clientcode: clientId,
-      password: pin,
-      totp: totpToken,
-    },
+    { clientcode: clientId, password: pin, totp: totpToken },
     {
       headers: {
         'Content-Type': 'application/json',
@@ -57,7 +48,7 @@ async function angelLogin() {
         'X-UserType': 'USER',
         'X-SourceID': 'WEB',
         'X-ClientLocalIP': '127.0.0.1',
-        'X-ClientPublicIP': '127.0.0.1',
+        'X-ClientPublicIP': '13.57.46.139',
         'X-MACAddress': '00:00:00:00:00:00',
         'X-PrivateKey': apiKey,
       }
@@ -65,63 +56,81 @@ async function angelLogin() {
   );
 
   if (!loginRes.data.data || !loginRes.data.data.jwtToken) {
-    console.error('Login response:', JSON.stringify(loginRes.data));
     throw new Error('Login failed: ' + JSON.stringify(loginRes.data));
   }
 
-  return loginRes.data.data.jwtToken;
+  return { jwt: loginRes.data.data.jwtToken, apiKey };
 }
 
-// ✅ OI Analysis endpoint
-app.get('/oi', async (req, res) => {
+// ✅ DEBUG — shows full raw Angel One response
+app.get('/debug', async (req, res) => {
   const symbol = req.query.symbol || 'NIFTY';
-
   try {
-    const jwtToken = await angelLogin();
+    const { jwt, apiKey } = await angelLogin();
 
     const oiRes = await axios.get(
       `https://apiconnect.angelone.in/rest/secure/angelbroking/marketData/v1/oi-data?name=${symbol}&expiryType=NEAR`,
       {
         headers: {
-          'Authorization': `Bearer ${jwtToken}`,
+          'Authorization': `Bearer ${jwt}`,
           'Content-Type': 'application/json',
           'Accept': 'application/json',
           'X-UserType': 'USER',
           'X-SourceID': 'WEB',
           'X-ClientLocalIP': '127.0.0.1',
-          'X-ClientPublicIP': '127.0.0.1',
+          'X-ClientPublicIP': '13.57.46.139',
           'X-MACAddress': '00:00:00:00:00:00',
-          'X-PrivateKey': process.env.ANGEL_API_KEY,
+          'X-PrivateKey': apiKey,
+        }
+      }
+    );
+
+    res.json({ loginOK: true, rawResponse: oiRes.data });
+
+  } catch (err) {
+    res.status(500).json({
+      loginOK: false,
+      error: err.message,
+      response: err.response?.data || null
+    });
+  }
+});
+
+// ✅ OI Analysis endpoint
+app.get('/oi', async (req, res) => {
+  const symbol = req.query.symbol || 'NIFTY';
+  try {
+    const { jwt, apiKey } = await angelLogin();
+
+    const oiRes = await axios.get(
+      `https://apiconnect.angelone.in/rest/secure/angelbroking/marketData/v1/oi-data?name=${symbol}&expiryType=NEAR`,
+      {
+        headers: {
+          'Authorization': `Bearer ${jwt}`,
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+          'X-UserType': 'USER',
+          'X-SourceID': 'WEB',
+          'X-ClientLocalIP': '127.0.0.1',
+          'X-ClientPublicIP': '13.57.46.139',
+          'X-MACAddress': '00:00:00:00:00:00',
+          'X-PrivateKey': apiKey,
         }
       }
     );
 
     const rows = oiRes.data?.data || [];
 
-    // Calculate OI analysis signals
     const analyzed = rows.map(row => {
       const priceChange = row.netChange || 0;
       const oiChange = row.oiChange || 0;
+      let signal = '', color = '';
 
-      let signal = '';
-      let color = '';
-
-      if (priceChange > 0 && oiChange > 0) {
-        signal = 'Long Buildup';
-        color = 'green';
-      } else if (priceChange < 0 && oiChange > 0) {
-        signal = 'Short Buildup';
-        color = 'red';
-      } else if (priceChange > 0 && oiChange < 0) {
-        signal = 'Short Covering';
-        color = 'blue';
-      } else if (priceChange < 0 && oiChange < 0) {
-        signal = 'Long Unwinding';
-        color = 'orange';
-      } else {
-        signal = 'Neutral';
-        color = 'gray';
-      }
+      if (priceChange > 0 && oiChange > 0)      { signal = 'Long Buildup';   color = 'green'; }
+      else if (priceChange < 0 && oiChange > 0) { signal = 'Short Buildup';  color = 'red'; }
+      else if (priceChange > 0 && oiChange < 0) { signal = 'Short Covering'; color = 'blue'; }
+      else if (priceChange < 0 && oiChange < 0) { signal = 'Long Unwinding'; color = 'orange'; }
+      else                                       { signal = 'Neutral';        color = 'gray'; }
 
       return { ...row, signal, color };
     });
