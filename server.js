@@ -16,6 +16,7 @@ const FYERS_REDIRECT_URI = 'https://tradehub-server-production.up.railway.app/ca
 // In-memory token store
 let accessToken = null;
 let tokenExpiry = null;
+let fyersInstance = null; // Official SDK instance
 
 function isTokenValid() {
   return accessToken && tokenExpiry && Date.now() < tokenExpiry;
@@ -23,14 +24,12 @@ function isTokenValid() {
 
 // ─── AUTH ─────────────────────────────────────────────────────────
 
-// Step 1: Visit /auth → redirects to Fyers login
 app.get('/auth', (req, res) => {
   const loginUrl = `https://api-t1.fyers.in/api/v3/generate-authcode?client_id=${FYERS_APP_ID}&redirect_uri=${encodeURIComponent(FYERS_REDIRECT_URI)}&response_type=code&state=tradehub`;
   console.log('Redirecting to Fyers login:', loginUrl);
   res.redirect(loginUrl);
 });
 
-// Step 2: Fyers redirects back here with ?auth_code=xxx or ?code=xxx
 app.get('/callback', async (req, res) => {
   console.log('Callback received. Query params:', req.query);
 
@@ -48,11 +47,9 @@ app.get('/callback', async (req, res) => {
   }
 
   try {
-    // Generate SHA256 hash: appId:secret
     const hashInput = `${FYERS_APP_ID}:${FYERS_SECRET}`;
     const appIdHash = crypto.createHash('sha256').update(hashInput).digest('hex');
     console.log('Auth code:', authCode);
-    console.log('App ID Hash generated');
 
     const response = await axios.post(
       'https://api-t1.fyers.in/api/v3/validate-authcode',
@@ -65,6 +62,20 @@ app.get('/callback', async (req, res) => {
     if (response.data.s === 'ok' && response.data.access_token) {
       accessToken = response.data.access_token;
       tokenExpiry = Date.now() + (23 * 60 * 60 * 1000);
+
+      // ✅ Try to init the official SDK
+      try {
+        const { fyersModel } = require('fyers-api-v3');
+        fyersInstance = new fyersModel({ path: '/tmp', enableLogging: false });
+        fyersInstance.setAppId(FYERS_APP_ID);
+        fyersInstance.setRedirectUrl(FYERS_REDIRECT_URI);
+        fyersInstance.setAccessToken(accessToken);
+        console.log('✅ Fyers SDK instance created');
+      } catch (sdkErr) {
+        console.warn('fyers-api-v3 SDK not available, will use raw HTTP:', sdkErr.message);
+        fyersInstance = null;
+      }
+
       console.log('✅ Access token saved! Valid for 23 hours.');
 
       return res.send(`
@@ -142,22 +153,9 @@ const SYMBOL_MAP = {
   MIDCPNIFTY: 'NSE:MIDCPNIFTY-INDEX',
 };
 
-async function fetchFyersOI(symbol) {
-  const fyersSymbol = SYMBOL_MAP[symbol] || 'NSE:NIFTY50-INDEX';
-
-  // ✅ FIX: Use api-t2 (data server) instead of api-t1 (auth server)
-  const response = await axios.get('https://api-t2.fyers.in/api/v3/options/chain', {
-    params: { symbol: fyersSymbol, strikecount: 10, timestamp: '' },
-    headers: {
-      'Authorization': `${FYERS_APP_ID}:${accessToken}`,
-      'Content-Type': 'application/json',
-    },
-  });
-
-  if (response.data.s !== 'ok') throw new Error('Fyers API error: ' + JSON.stringify(response.data));
-
-  const optionsData = response.data.data?.optionsChain || [];
-  const underlyingValue = response.data.data?.ltp || 0;
+function parseOptionChain(responseData) {
+  const optionsData = responseData.data?.optionsChain || [];
+  const underlyingValue = responseData.data?.ltp || 0;
   const expiryDates = [...new Set(optionsData.map(o => o.expiry))].sort();
   const nearExpiry = expiryDates[0];
 
@@ -176,6 +174,38 @@ async function fetchFyersOI(symbol) {
     }));
 
   return { underlyingValue, nearExpiry, expiryDates, rows };
+}
+
+// ✅ Triple-attempt: SDK → api-t1 → api-t2
+async function fetchFyersOI(symbol) {
+  const fyersSymbol = SYMBOL_MAP[symbol] || 'NSE:NIFTY50-INDEX';
+  const params = { symbol: fyersSymbol, strikecount: 10, timestamp: '' };
+  const headers = { 'Authorization': `${FYERS_APP_ID}:${accessToken}` };
+
+  // Attempt 1: Official SDK
+  if (fyersInstance) {
+    try {
+      console.log('Trying SDK optionchain...');
+      const sdkRes = await fyersInstance.optionchain(params);
+      console.log('SDK status:', sdkRes?.s);
+      if (sdkRes?.s === 'ok') return parseOptionChain(sdkRes);
+    } catch (e) { console.warn('SDK failed:', e.message); }
+  }
+
+  // Attempt 2: api-t1
+  try {
+    console.log('Trying api-t1...');
+    const r = await axios.get('https://api-t1.fyers.in/api/v3/options/chain', { params, headers });
+    console.log('api-t1 status:', r.data?.s, '| code:', r.data?.code);
+    if (r.data?.s === 'ok') return parseOptionChain(r.data);
+  } catch (e) { console.warn('api-t1 failed:', e.response?.status, e.message); }
+
+  // Attempt 3: api-t2
+  console.log('Trying api-t2...');
+  const r2 = await axios.get('https://api-t2.fyers.in/api/v3/options/chain', { params, headers });
+  console.log('api-t2 status:', r2.data?.s, '| code:', r2.data?.code);
+  if (r2.data?.s === 'ok') return parseOptionChain(r2.data);
+  throw new Error('All attempts failed. Last response: ' + JSON.stringify(r2.data));
 }
 
 // ─── ROUTES ───────────────────────────────────────────────────────
