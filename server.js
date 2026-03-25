@@ -145,7 +145,8 @@ const SYMBOL_MAP = {
 async function fetchFyersOI(symbol) {
   const fyersSymbol = SYMBOL_MAP[symbol] || 'NSE:NIFTY50-INDEX';
 
-  const response = await axios.get('https://api-t1.fyers.in/api/v3/options/chain', {
+  // ✅ FIX: Use api-t2 (data server) instead of api-t1 (auth server)
+  const response = await axios.get('https://api-t2.fyers.in/api/v3/options/chain', {
     params: { symbol: fyersSymbol, strikecount: 10, timestamp: '' },
     headers: {
       'Authorization': `${FYERS_APP_ID}:${accessToken}`,
