@@ -22,6 +22,20 @@ function isTokenValid() {
   return accessToken && tokenExpiry && Date.now() < tokenExpiry;
 }
 
+function initFyersSDK(token) {
+  try {
+    const { fyersModel } = require('fyers-api-v3');
+    fyersInstance = new fyersModel({ path: '/tmp', enableLogging: false });
+    fyersInstance.setAppId(FYERS_APP_ID);
+    fyersInstance.setRedirectUrl(FYERS_REDIRECT_URI);
+    fyersInstance.setAccessToken(token);
+    console.log('✅ Fyers SDK (v1.4.2) instance created');
+  } catch (e) {
+    console.warn('Fyers SDK init failed:', e.message);
+    fyersInstance = null;
+  }
+}
+
 // ─── AUTH ─────────────────────────────────────────────────────────
 
 app.get('/auth', (req, res) => {
@@ -62,20 +76,7 @@ app.get('/callback', async (req, res) => {
     if (response.data.s === 'ok' && response.data.access_token) {
       accessToken = response.data.access_token;
       tokenExpiry = Date.now() + (23 * 60 * 60 * 1000);
-
-      // ✅ Try to init the official SDK
-      try {
-        const { fyersModel } = require('fyers-api-v3');
-        fyersInstance = new fyersModel({ path: '/tmp', enableLogging: false });
-        fyersInstance.setAppId(FYERS_APP_ID);
-        fyersInstance.setRedirectUrl(FYERS_REDIRECT_URI);
-        fyersInstance.setAccessToken(accessToken);
-        console.log('✅ Fyers SDK instance created');
-      } catch (sdkErr) {
-        console.warn('fyers-api-v3 SDK not available, will use raw HTTP:', sdkErr.message);
-        fyersInstance = null;
-      }
-
+      initFyersSDK(accessToken);
       console.log('✅ Access token saved! Valid for 23 hours.');
 
       return res.send(`
@@ -176,36 +177,42 @@ function parseOptionChain(responseData) {
   return { underlyingValue, nearExpiry, expiryDates, rows };
 }
 
-// ✅ Triple-attempt: SDK → api-t1 → api-t2
+// ✅ Try SDK first, then raw HTTP fallback
 async function fetchFyersOI(symbol) {
   const fyersSymbol = SYMBOL_MAP[symbol] || 'NSE:NIFTY50-INDEX';
   const params = { symbol: fyersSymbol, strikecount: 10, timestamp: '' };
   const headers = { 'Authorization': `${FYERS_APP_ID}:${accessToken}` };
 
-  // Attempt 1: Official SDK
+  // Attempt 1: Official SDK (v1.4.2)
   if (fyersInstance) {
     try {
       console.log('Trying SDK optionchain...');
       const sdkRes = await fyersInstance.optionchain(params);
-      console.log('SDK status:', sdkRes?.s);
+      console.log('SDK status:', sdkRes?.s, '| code:', sdkRes?.code);
       if (sdkRes?.s === 'ok') return parseOptionChain(sdkRes);
-    } catch (e) { console.warn('SDK failed:', e.message); }
+      console.warn('SDK non-ok response:', JSON.stringify(sdkRes));
+    } catch (e) {
+      console.warn('SDK optionchain threw:', e.message);
+    }
   }
 
-  // Attempt 2: api-t1
+  // Attempt 2: api-t1 raw HTTP
   try {
-    console.log('Trying api-t1...');
-    const r = await axios.get('https://api-t1.fyers.in/api/v3/options/chain', { params, headers });
-    console.log('api-t1 status:', r.data?.s, '| code:', r.data?.code);
-    if (r.data?.s === 'ok') return parseOptionChain(r.data);
-  } catch (e) { console.warn('api-t1 failed:', e.response?.status, e.message); }
+    console.log('Trying api-t1 raw HTTP...');
+    const r1 = await axios.get('https://api-t1.fyers.in/api/v3/options/chain', { params, headers });
+    console.log('api-t1 status:', r1.data?.s, '| code:', r1.data?.code);
+    if (r1.data?.s === 'ok') return parseOptionChain(r1.data);
+    console.warn('api-t1 non-ok:', r1.data?.message || JSON.stringify(r1.data));
+  } catch (e) {
+    console.warn('api-t1 threw:', e.response?.status, e.message);
+  }
 
-  // Attempt 3: api-t2
-  console.log('Trying api-t2...');
+  // Attempt 3: api-t2 raw HTTP
+  console.log('Trying api-t2 raw HTTP...');
   const r2 = await axios.get('https://api-t2.fyers.in/api/v3/options/chain', { params, headers });
   console.log('api-t2 status:', r2.data?.s, '| code:', r2.data?.code);
   if (r2.data?.s === 'ok') return parseOptionChain(r2.data);
-  throw new Error('All attempts failed. Last response: ' + JSON.stringify(r2.data));
+  throw new Error('All attempts failed. Last: ' + JSON.stringify(r2.data));
 }
 
 // ─── ROUTES ───────────────────────────────────────────────────────
